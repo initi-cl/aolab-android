@@ -22,9 +22,14 @@ class AppConfig {
     defaultValue: 'b98f7c67-28c5-41ac-bd76-12f1af8594e6',
   );
 
-  /// Cuentas de organizaciones (sin cuentas personales), igual que la web.
-  static const String microsoftDiscoveryUrl =
-      'https://login.microsoftonline.com/organizations/v2.0/.well-known/openid-configuration';
+  /// Cuentas de organizaciones (sin cuentas personales), igual que la web. Se dan los puntos de entrada a mano, sin el
+  /// documento de descubrimiento: Microsoft publica ahí el emisor como `https://login.microsoftonline.com/{tenantid}/v2.0`
+  /// (literal), y AppAuth compara el emisor del idToken con ese texto, así que el ingreso fallaba siempre con «Issuer
+  /// mismatch». Sin documento, AppAuth no hace esa comparación; el emisor real (el de la organización) lo valida el
+  /// servidor en /api/auth/microsoft, igual que en la web.
+  static const String microsoftAuthorizationEndpoint =
+      'https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize';
+  static const String microsoftTokenEndpoint = 'https://login.microsoftonline.com/organizations/oauth2/v2.0/token';
 
   /// El retorno de Microsoft para un paquete firmado con una llave dada: `msauth://<paquete>/<hash de la firma>`, como lo
   /// registra Entra para Android. Solo el canal de producción (cl.makki.aolab, llave de prod) lo tiene registrado; otro

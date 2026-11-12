@@ -73,7 +73,11 @@ class InicioMicrosoft implements InicioExterno {
       final r = await _appAuth.authorizeAndExchangeCode(AuthorizationTokenRequest(
         AppConfig.microsoftClientId,
         redirect,
-        discoveryUrl: AppConfig.microsoftDiscoveryUrl,
+        // Sin discoveryUrl a propósito: ver AppConfig.microsoftAuthorizationEndpoint.
+        serviceConfiguration: const AuthorizationServiceConfiguration(
+          authorizationEndpoint: AppConfig.microsoftAuthorizationEndpoint,
+          tokenEndpoint: AppConfig.microsoftTokenEndpoint,
+        ),
         scopes: const ['openid', 'profile', 'email'],
         loginHint: correo,
         promptValues: const ['select_account'],
