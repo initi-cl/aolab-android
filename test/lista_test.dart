@@ -1,6 +1,7 @@
 // La lista de evaluaciones (PLAN F4.1 y F5): sale al tiro desde la tablet aunque el servidor tarde, títulos con centro y
 // fecha, filtro por estado, borrar una Agendada creada por error y la barra de la sincronización en palabras del
-// evaluador.
+// evaluador. Aquí las evaluaciones no tienen cliente: la app parte en las pisciculturas de «Sin cliente» (la navegación
+// por niveles se prueba en navegacion_test.dart).
 import 'package:aolab_android/models/audit.dart';
 import 'package:aolab_android/models/master.dart';
 import 'package:aolab_android/services/audit_sync_service.dart';
@@ -31,6 +32,13 @@ void main() {
     if (settle) await t.pumpAndSettle();
   }
 
+  Future<void> entrar(WidgetTester t, String clave) async {
+    await t.tap(find.byKey(ValueKey(clave)));
+    await t.pumpAndSettle();
+  }
+
+  const demo = 'centro-c0000000-0000-0000-0000-000000000001';
+
   void tres() {
     db = BaseEnMemoria([centro]);
     final nueva = evaluacion(id: 'nueva', status: 3, serverVersion: 0)
@@ -49,7 +57,8 @@ void main() {
     srv.demoras['GET /api/questionnaire/template'] = const Duration(seconds: 30);
     await abrir(t, settle: false);
     await t.pump(const Duration(milliseconds: 200));
-    expect(find.byKey(const ValueKey('ev-curso')), findsOneWidget);
+    expect(find.byKey(const ValueKey(demo)), findsOneWidget);
+    expect(find.text('3 evaluaciones'), findsOneWidget);
     await t.pump(const Duration(seconds: 31)); // termina la consulta lenta
     await t.pumpAndSettle();
   });
@@ -57,16 +66,21 @@ void main() {
   testWidgets('títulos con centro y fecha; una nueva dice «Evaluación nueva»', (t) async {
     tres();
     await abrir(t);
-    expect(find.text('Evaluación nueva · 20-10-2026'), findsOneWidget);
+    await entrar(t, demo);
     expect(find.text('Centro Demo · 20-10-2026'), findsNWidgets(3));
-    expect(find.textContaining('Sin cliente'), findsNothing);
     expect(find.textContaining('Folio 3002'), findsOneWidget);
+    await t.pageBack();
+    await t.pumpAndSettle();
+    await entrar(t, 'centro-');
+    expect(find.text('Evaluación nueva · 20-10-2026'), findsOneWidget);
   });
 
   testWidgets('filtro por estado', (t) async {
     tres();
     await abrir(t);
-    expect(find.text('Agendadas (2)'), findsOneWidget);
+    await entrar(t, demo);
+    expect(find.text('Todas (3)'), findsOneWidget);
+    expect(find.text('Agendadas (1)'), findsOneWidget);
     await t.tap(find.byKey(const ValueKey('filtro-finalizadas')));
     await t.pumpAndSettle();
     expect(find.byKey(const ValueKey('ev-fin')), findsOneWidget);
@@ -80,9 +94,13 @@ void main() {
   testWidgets('solo una Agendada que nunca subió se puede borrar, y con confirmación', (t) async {
     tres();
     await abrir(t);
-    expect(find.byKey(const ValueKey('menu-nueva')), findsOneWidget);
+    await entrar(t, demo);
     expect(find.byKey(const ValueKey('menu-agendada-servidor')), findsNothing);
     expect(find.byKey(const ValueKey('menu-curso')), findsNothing);
+    await t.pageBack();
+    await t.pumpAndSettle();
+    await entrar(t, 'centro-');
+    expect(find.byKey(const ValueKey('menu-nueva')), findsOneWidget);
     await t.tap(find.byKey(const ValueKey('menu-nueva')));
     await t.pumpAndSettle();
     await t.tap(find.text('Borrar'));

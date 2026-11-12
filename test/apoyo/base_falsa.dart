@@ -27,8 +27,9 @@ class BaseEnMemoria extends AppDatabase {
   final Map<String, Audit> audits = {};
   final Map<String, String> kv = {};
   final List<CenterRef> centros;
+  final List<ClientRef> clientes;
   int guardados = 0;
-  BaseEnMemoria(this.centros);
+  BaseEnMemoria(this.centros, {this.clientes = const []});
 
   Audit _copia(Audit a) => Audit.fromRow(a.toRow());
 
@@ -42,7 +43,7 @@ class BaseEnMemoria extends AppDatabase {
   }
 
   @override
-  Future<List<ClientRef>> activeClients() async => [];
+  Future<List<ClientRef>> activeClients() async => clientes;
   @override
   Future<List<CenterRef>> activeCenters() async => centros;
   @override

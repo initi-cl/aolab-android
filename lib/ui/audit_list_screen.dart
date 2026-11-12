@@ -6,12 +6,15 @@ import 'package:provider/provider.dart';
 import 'package:uuid/uuid.dart';
 
 import '../data/app_database.dart';
+import '../data/reglas_sync.dart';
 import '../models/audit.dart';
+import '../models/master.dart';
 import '../services/audit_sync_service.dart';
 import '../services/auth_service.dart';
 import '../services/evidencias_en_fila.dart';
 import '../services/media_service.dart';
 import '../services/template_service.dart';
+import 'arbol_evaluaciones.dart';
 import 'audit_edit_screen.dart';
 import 'login_screen.dart';
 import 'tema.dart';
@@ -53,9 +56,20 @@ class AuditListScreen extends StatefulWidget {
   State<AuditListScreen> createState() => _AuditListScreenState();
 }
 
+/// Los tres niveles de la lista: se navega Cliente → Piscicultura → sus evaluaciones.
+enum NivelLista { clientes, pisciculturas, evaluaciones }
+
 class _AuditListScreenState extends State<AuditListScreen> {
-  List<Audit> _audits = [];
+  List<ClientRef> _clientes = [];
+  List<CenterRef> _centros = [];
+  List<GrupoCliente> _grupos = [];
   int _pending = 0;
+  // Lo elegido al navegar: la clave del grupo y su nombre (null = todavía no se elige). Con un solo cliente no se elige:
+  // se parte en sus pisciculturas.
+  String? _clienteSel;
+  String? _nombreClienteSel;
+  String? _centroSel;
+  String? _nombreCentroSel;
   bool _loading = true;
   FiltroLista _filtro = FiltroLista.todas;
   bool _outdated = false;
@@ -106,14 +120,80 @@ class _AuditListScreenState extends State<AuditListScreen> {
     final db = context.read<AppDatabase>();
     final media = context.read<MediaService>();
     final audits = await db.visibleAudits();
-    final pending = await pendientesDeLaTablet(db, media);
+    final clientes = await db.activeClients();
+    final centros = await db.activeCenters();
+    final pending = await pendientesDeLaTablet(db, media); // deja lista la carpeta de las evidencias (hasLocal)
+    final porSubir = {
+      for (final a in audits)
+        if (quedaPorSubir(a, enEstaTablet: media.hasLocal)) a.id,
+    };
     if (!mounted) return;
     setState(() {
-      _audits = audits;
+      _clientes = clientes;
+      _centros = centros;
+      _grupos = agruparEvaluaciones(evaluaciones: audits, clientes: clientes, centros: centros, porSubir: porSubir);
       _pending = pending;
       _loading = false;
     });
   }
+
+  // ── Navegación: Cliente → Piscicultura → evaluaciones ──
+
+  /// Con un solo cliente (o solo «Sin cliente») no hay nada que elegir: se parte en sus pisciculturas.
+  bool get _saltaClientes => _grupos.length == 1;
+
+  /// El cliente en que se está (el elegido o el único), o null en el nivel de clientes.
+  GrupoCliente? get _cliente {
+    final clave = _clienteSel ?? (_saltaClientes ? _grupos.single.clave : null);
+    if (clave == null) return null;
+    for (final g in _grupos) {
+      if (g.clave == clave) return g;
+    }
+    // Se fue su última evaluación (se le cambió el cliente): queda vacío, con el nombre que tenía.
+    return GrupoCliente(clave == kSinAsignar ? null : clave, _nombreClienteSel ?? kSinCliente);
+  }
+
+  /// La piscicultura en que se está, o null si no se ha elegido.
+  GrupoCentro? get _centro {
+    final g = _cliente;
+    final clave = _centroSel;
+    if (g == null || clave == null) return null;
+    return g.centro(clave) ?? GrupoCentro(clave == kSinAsignar ? null : clave, _nombreCentroSel ?? kSinPiscicultura);
+  }
+
+  NivelLista get _nivel => _cliente == null
+      ? NivelLista.clientes
+      : _centro == null
+          ? NivelLista.pisciculturas
+          : NivelLista.evaluaciones;
+
+  /// ¿Se está en el primer nivel? Ahí «atrás» sale de la app; en los otros, sube un nivel.
+  bool get _enRaiz => _nivel == NivelLista.clientes || (_nivel == NivelLista.pisciculturas && _clienteSel == null);
+
+  void _elegirCliente(GrupoCliente g) => setState(() {
+        _clienteSel = g.clave;
+        _nombreClienteSel = g.nombre;
+        _centroSel = null;
+      });
+
+  void _elegirCentro(GrupoCentro c) => setState(() {
+        _centroSel = c.clave;
+        _nombreCentroSel = c.nombre;
+      });
+
+  void _subir() => setState(() {
+        if (_nivel == NivelLista.evaluaciones) {
+          _centroSel = null;
+        } else {
+          _clienteSel = null;
+          _centroSel = null;
+        }
+      });
+
+  void _irAClientes() => setState(() {
+        _clienteSel = null;
+        _centroSel = null;
+      });
 
   Future<void> _sync() async {
     await context.read<AuditSyncService>().sync();
@@ -161,9 +241,17 @@ class _AuditListScreenState extends State<AuditListScreen> {
   Future<void> _create() async {
     final db = context.read<AppDatabase>();
     final now = DateTime.now().toUtc();
+    // Creada desde dentro de un cliente o de una piscicultura, nace con ellos elegidos (si siguen activos en el maestro:
+    // si no, la ficha no los podría mostrar).
+    final cliente = _clientes.where((c) => c.id == _cliente?.id).firstOrNull;
+    final centro = _centros.where((c) => c.id == _centro?.id).firstOrNull;
     final audit = Audit(
       id: const Uuid().v4(),
       status: 3, // Agendada: el muestreo (folio/correlativos) se inicia después
+      clientId: cliente?.id,
+      clientName: cliente?.name,
+      centerId: centro?.id,
+      centerName: centro?.name ?? '(sin nombre)',
       createdAtUtc: now,
       updatedAtUtc: now,
       // createdByName lo resuelve el servidor (nombre completo del usuario) al pushear.
@@ -210,65 +298,237 @@ class _AuditListScreenState extends State<AuditListScreen> {
   @override
   Widget build(BuildContext context) {
     final sync = context.watch<AuditSyncService>();
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Evaluaciones'),
-        actions: [
-          IconButton(
-            tooltip: 'Sincronizar',
-            onPressed: sync.status == SyncStatus.syncing ? null : _sync,
-            icon: sync.status == SyncStatus.syncing
-                ? const SizedBox(height: 18, width: 18, child: CircularProgressIndicator(strokeWidth: 2))
-                : const Icon(Icons.sync),
+    final nivel = _nivel;
+    // «Atrás» (el del AppBar o el de Android) sube un nivel; en el primero, sale como siempre.
+    return PopScope(
+      canPop: _enRaiz,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop) _subir();
+      },
+      child: Scaffold(
+        appBar: AppBar(
+          leading: _enRaiz ? null : BackButton(key: const ValueKey('subir'), onPressed: _subir),
+          title: _titulo(nivel),
+          actions: [
+            IconButton(
+              tooltip: 'Sincronizar',
+              onPressed: sync.status == SyncStatus.syncing ? null : _sync,
+              icon: sync.status == SyncStatus.syncing
+                  ? const SizedBox(height: 18, width: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                  : const Icon(Icons.sync),
+            ),
+            // Cerrar sesión va en el menú, con confirmación: en terreno no se cierra por error.
+            PopupMenuButton<String>(
+              tooltip: 'Más opciones',
+              onSelected: (v) {
+                if (v == 'salir') _cerrarSesion();
+              },
+              itemBuilder: (_) => [
+                PopupMenuItem<String>(
+                  enabled: false,
+                  child: Text(context.read<AuthService>().email ?? '', style: const TextStyle(fontSize: 13)),
+                ),
+                const PopupMenuItem<String>(
+                  value: 'salir',
+                  child: Row(children: [Icon(Icons.logout, size: 20), SizedBox(width: 10), Text('Cerrar sesión')]),
+                ),
+              ],
+            ),
+          ],
+          bottom: PreferredSize(
+            preferredSize: const Size.fromHeight(30),
+            child: StatusBarSync(status: sync.status, pending: _pending, lastError: sync.lastError, lastSyncAt: sync.lastSyncAt),
           ),
-          // Cerrar sesión va en el menú, con confirmación: en terreno no se cierra por error.
-          PopupMenuButton<String>(
-            tooltip: 'Más opciones',
-            onSelected: (v) {
-              if (v == 'salir') _cerrarSesion();
-            },
-            itemBuilder: (_) => [
-              PopupMenuItem<String>(
-                enabled: false,
-                child: Text(context.read<AuthService>().email ?? '', style: const TextStyle(fontSize: 13)),
-              ),
-              const PopupMenuItem<String>(
-                value: 'salir',
-                child: Row(children: [Icon(Icons.logout, size: 20), SizedBox(width: 10), Text('Cerrar sesión')]),
-              ),
-            ],
-          ),
-        ],
-        bottom: PreferredSize(
-          preferredSize: const Size.fromHeight(30),
-          child: StatusBarSync(status: sync.status, pending: _pending, lastError: sync.lastError, lastSyncAt: sync.lastSyncAt),
         ),
-      ),
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: _create,
-        icon: const Icon(Icons.add),
-        label: const Text('Nueva'),
-      ),
-      body: _loading
-          ? const Center(child: CircularProgressIndicator())
-          : Column(children: [
-              if (_outdated)
-                Material(
-                  color: const Color(0xFFD13438),
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-                    child: Row(children: [
-                      const Icon(Icons.system_update, color: Colors.white, size: 20),
-                      const SizedBox(width: 8),
-                      Expanded(child: Text(_outdatedMsg, style: const TextStyle(color: Colors.white, fontSize: 13))),
-                    ]),
+        floatingActionButton: FloatingActionButton.extended(
+          onPressed: _create,
+          icon: const Icon(Icons.add),
+          label: const Text('Nueva'),
+        ),
+        body: _loading
+            ? const Center(child: CircularProgressIndicator())
+            : Column(children: [
+                if (_outdated)
+                  Material(
+                    color: const Color(0xFFD13438),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                      child: Row(children: [
+                        const Icon(Icons.system_update, color: Colors.white, size: 20),
+                        const SizedBox(width: 8),
+                        Expanded(child: Text(_outdatedMsg, style: const TextStyle(color: Colors.white, fontSize: 13))),
+                      ]),
+                    ),
+                  ),
+                if (context.watch<AuthService>().sesionVencida) _avisoVencida(),
+                if (sync.avisos.isNotEmpty) _avisos(sync),
+                if (!_enRaiz) _migas(nivel),
+                if (nivel == NivelLista.evaluaciones && _centro!.evaluaciones.isNotEmpty) _filtros(),
+                Expanded(
+                  child: RefreshIndicator(
+                    onRefresh: _sync,
+                    child: switch (nivel) {
+                      NivelLista.clientes => _listaClientes(),
+                      NivelLista.pisciculturas => _listaCentros(_cliente!),
+                      NivelLista.evaluaciones => _body(_centro!),
+                    },
                   ),
                 ),
-              if (context.watch<AuthService>().sesionVencida) _avisoVencida(),
-              if (sync.avisos.isNotEmpty) _avisos(sync),
-              if (_audits.isNotEmpty) _filtros(),
-              Expanded(child: _body()),
-            ]),
+              ]),
+      ),
+    );
+  }
+
+  /// El título dice dónde se está: «Clientes», el cliente (con «Pisciculturas» encima) o la piscicultura (con su
+  /// cliente encima).
+  Widget _titulo(NivelLista nivel) {
+    final (encima, nombre) = switch (nivel) {
+      NivelLista.clientes => (null, 'Clientes'),
+      NivelLista.pisciculturas => ('Pisciculturas', _cliente!.nombre),
+      NivelLista.evaluaciones => (_cliente!.nombre, _centro!.nombre),
+    };
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+      if (encima != null)
+        Text(encima,
+            key: const ValueKey('titulo-encima'),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(fontSize: 13, color: Colores.texto2)),
+      Text(nombre, key: const ValueKey('titulo'), maxLines: 1, overflow: TextOverflow.ellipsis),
+    ]);
+  }
+
+  /// El camino recorrido, para volver a cualquier nivel de un toque: Clientes › Cliente › Piscicultura.
+  Widget _migas(NivelLista nivel) {
+    Widget paso(String texto, VoidCallback? alTocar, {Key? key}) => alTocar == null
+        ? Text(texto, style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: Colores.tinta))
+        : InkWell(
+            key: key,
+            onTap: alTocar,
+            borderRadius: BorderRadius.circular(6),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 8),
+              child: Text(texto,
+                  style: const TextStyle(fontSize: 14, color: Colores.marca, decoration: TextDecoration.underline)),
+            ),
+          );
+    const sep = Padding(
+      padding: EdgeInsets.symmetric(horizontal: 4),
+      child: Icon(Icons.chevron_right, size: 18, color: Colores.texto2),
+    );
+    final g = _cliente!;
+    return Container(
+      width: double.infinity,
+      color: Colores.fondoSuave,
+      padding: const EdgeInsets.symmetric(horizontal: 12),
+      child: SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        child: Row(children: [
+          if (_clienteSel != null) ...[
+            paso('Clientes', _irAClientes, key: const ValueKey('miga-clientes')),
+            sep,
+          ],
+          if (nivel == NivelLista.evaluaciones) ...[
+            paso(g.nombre, () => setState(() => _centroSel = null), key: const ValueKey('miga-cliente')),
+            sep,
+            paso(_centro!.nombre, null),
+          ] else
+            paso(g.nombre, null),
+        ]),
+      ),
+    );
+  }
+
+  /// Lo que no tiene nada que mostrar, al medio y con espacio para tirar hacia abajo (sincronizar).
+  Widget _vacio(String texto) => ListView(children: [
+        const SizedBox(height: 140),
+        Center(child: Text(texto, style: const TextStyle(fontSize: 15, color: Colores.texto2))),
+      ]);
+
+  /// Una fila de cliente o de piscicultura: el nombre, lo que tiene y lo que falta subir.
+  Widget _filaGrupo({
+    required Key key,
+    required IconData icono,
+    required String nombre,
+    required String detalle,
+    required int porSubir,
+    required bool sinAsignar,
+    required VoidCallback alTocar,
+  }) {
+    final color = sinAsignar ? Colores.pendiente : Colores.marca;
+    return ListTile(
+      key: key,
+      minVerticalPadding: 10,
+      leading: Container(
+        width: 44,
+        alignment: Alignment.center,
+        padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 2),
+        decoration: BoxDecoration(color: color.withValues(alpha: 0.12), borderRadius: BorderRadius.circular(6)),
+        child: Icon(sinAsignar ? Icons.help_outline : icono, color: color, size: 20),
+      ),
+      title: Text(nombre,
+          style: TextStyle(
+              fontSize: 16, fontWeight: FontWeight.w600, fontStyle: sinAsignar ? FontStyle.italic : FontStyle.normal)),
+      subtitle: Text.rich(
+        TextSpan(children: [
+          TextSpan(text: detalle),
+          if (porSubir > 0)
+            TextSpan(
+                text: ' · $porSubir por subir',
+                style: const TextStyle(color: Colores.pendiente, fontWeight: FontWeight.w600)),
+        ]),
+        style: const TextStyle(fontSize: 14, color: Colores.texto2),
+      ),
+      trailing: Row(mainAxisSize: MainAxisSize.min, children: [
+        if (porSubir > 0)
+          const Tooltip(message: 'Falta subir', child: Icon(Icons.cloud_upload_outlined, size: 22, color: Colores.pendiente)),
+        const SizedBox(width: 4),
+        const Icon(Icons.chevron_right, color: Colores.texto2),
+      ]),
+      onTap: alTocar,
+    );
+  }
+
+  Widget _listaClientes() {
+    if (_grupos.isEmpty) return _vacio('Sin evaluaciones.');
+    return ListView.separated(
+      padding: const EdgeInsets.only(bottom: 88), // que el botón «Nueva» no tape el último
+      itemCount: _grupos.length,
+      separatorBuilder: (_, __) => const Divider(height: 1),
+      itemBuilder: (_, i) {
+        final g = _grupos[i];
+        return _filaGrupo(
+          key: ValueKey('cliente-${g.clave}'),
+          icono: Icons.business_outlined,
+          nombre: g.nombre,
+          detalle: [if (g.pisciculturas > 0) nPisciculturas(g.pisciculturas), nEvaluaciones(g.evaluaciones)].join(' · '),
+          porSubir: g.porSubir,
+          sinAsignar: g.id == null,
+          alTocar: () => _elegirCliente(g),
+        );
+      },
+    );
+  }
+
+  Widget _listaCentros(GrupoCliente g) {
+    final centros = g.centros;
+    if (centros.isEmpty) return _vacio('Sin evaluaciones.');
+    return ListView.separated(
+      padding: const EdgeInsets.only(bottom: 88),
+      itemCount: centros.length,
+      separatorBuilder: (_, __) => const Divider(height: 1),
+      itemBuilder: (_, i) {
+        final c = centros[i];
+        return _filaGrupo(
+          key: ValueKey('centro-${c.clave}'),
+          icono: Icons.water_outlined,
+          nombre: c.nombre,
+          detalle: nEvaluaciones(c.evaluaciones.length),
+          porSubir: c.porSubir,
+          sinAsignar: c.id == null,
+          alTocar: () => _elegirCentro(c),
+        );
+      },
     );
   }
 
@@ -321,7 +581,8 @@ class _AuditListScreenState extends State<AuditListScreen> {
           for (final f in FiltroLista.values) ...[
             ChoiceChip(
               key: ValueKey('filtro-${f.name}'),
-              label: Text('${f.etiqueta} (${_audits.where(f.incluye).length})', style: const TextStyle(fontSize: 14)),
+              label: Text('${f.etiqueta} (${_centro!.evaluaciones.where(f.incluye).length})',
+                  style: const TextStyle(fontSize: 14)),
               selected: _filtro == f,
               onSelected: (_) => setState(() => _filtro = f),
             ),
@@ -330,31 +591,23 @@ class _AuditListScreenState extends State<AuditListScreen> {
         ]),
       );
 
-  Widget _body() {
-    final lista = _audits.where(_filtro.incluye).toList();
-    return RefreshIndicator(
-      onRefresh: _sync,
-      child: lista.isEmpty
-          ? ListView(children: [
-              const SizedBox(height: 140),
-              Center(
-                child: Text(_audits.isEmpty ? 'Sin evaluaciones.' : 'Ninguna ${_filtro.etiqueta.toLowerCase()}.',
-                    style: const TextStyle(fontSize: 15, color: Colores.texto2)),
-              ),
-            ])
-          : ListView.separated(
-              padding: const EdgeInsets.only(bottom: 88), // que el botón «Nueva» no tape la última
-              itemCount: lista.length,
-              separatorBuilder: (_, __) => const Divider(height: 1),
-              itemBuilder: (_, i) => _fila(lista[i]),
-            ),
+  /// Las evaluaciones de una piscicultura (lo que antes era la lista entera), con el filtro por estado.
+  Widget _body(GrupoCentro c) {
+    final lista = c.evaluaciones.where(_filtro.incluye).toList();
+    if (lista.isEmpty) {
+      return _vacio(c.evaluaciones.isEmpty ? 'Sin evaluaciones.' : 'Ninguna ${_filtro.etiqueta.toLowerCase()}.');
+    }
+    return ListView.separated(
+      padding: const EdgeInsets.only(bottom: 88), // que el botón «Nueva» no tape la última
+      itemCount: lista.length,
+      separatorBuilder: (_, __) => const Divider(height: 1),
+      itemBuilder: (_, i) => _fila(lista[i]),
     );
   }
 
   Widget _fila(Audit a) {
     final detalle = [
-      if (a.folio != null) 'Folio ${a.folio}',
-      if (a.clientName != null && a.clientName!.trim().isNotEmpty) a.clientName!,
+      if (a.folio != null) 'Folio ${a.folio}', // el cliente y la piscicultura ya están en el título de la pantalla
       a.auditor ?? 'sin evaluador',
       a.typeEnum.label,
     ].join(' · ');

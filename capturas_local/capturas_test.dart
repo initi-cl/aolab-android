@@ -91,6 +91,31 @@ void main() {
     await captura('01-lista');
   });
 
+  // La lista por niveles: Cliente → Piscicultura → evaluaciones.
+  testWidgets('01 niveles', (t) async {
+    final db = BaseEnMemoria([
+      centro..ownerClientId = 'k1',
+      CenterRef(id: 'c2', name: 'Piscicultura Los Ríos', ownerClientId: 'k1'),
+      CenterRef(id: 'c3', name: 'Piscicultura Chiculdeo', ownerClientId: 'k2'),
+    ], clientes: [ClientRef(id: 'k1', name: 'Cliente Demo'), ClientRef(id: 'k2', name: 'Salmones del Sur')]);
+    db.audits.addAll(base().audits);
+    for (final id in ['e1', 'fin', 'comp']) {
+      db.audits[id]!.clientId = 'k1';
+    }
+    db.audits['otra'] = evaluacion(id: 'otra')
+      ..clientId = 'k2'
+      ..centerId = 'c3'
+      ..centerName = 'Piscicultura Chiculdeo';
+    await montar(t, const AuditListScreen(), db);
+    await captura('01a-clientes');
+    await t.tap(find.text('Cliente Demo'));
+    await t.pumpAndSettle();
+    await captura('01b-pisciculturas');
+    await t.tap(find.text('Centro Demo'));
+    await t.pumpAndSettle();
+    await captura('01c-evaluaciones');
+  });
+
   testWidgets('02 sistemas', (t) async {
     await montar(t, const AuditEditScreen(auditId: 'e1'), base(), tamano: const Size(800, 1700));
     await pestana(t, 'Sistemas');
