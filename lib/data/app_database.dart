@@ -4,6 +4,7 @@ import 'package:path/path.dart' as p;
 import 'package:sqflite/sqflite.dart';
 
 import '../models/audit.dart';
+import '../models/maestro_terreno.dart';
 import '../models/master.dart';
 import 'reglas_sync.dart';
 
@@ -11,7 +12,7 @@ import 'reglas_sync.dart';
 /// guarda las auditorías, el cursor de sync y la plantilla cacheada.
 class AppDatabase {
   static const _dbName = 'aolab.db';
-  static const _dbVersion = 10;
+  static const _dbVersion = 11;
 
   Database? _db;
 
@@ -26,6 +27,7 @@ class AppDatabase {
         await _createAudits(db);
         await _createMasters(db);
         await _createUsers(db);
+        await _createMaestrosPendientes(db);
         await db.execute('CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);');
       },
       onUpgrade: (db, oldV, newV) async {
@@ -85,6 +87,11 @@ class AppDatabase {
           // una fila que se editó mientras el envío iba y volvía, y el editor sabe si el servidor le reemplazó la fila
           // mientras la tenía abierta. No se resetea ningún cursor.
           try { await db.execute('ALTER TABLE audits ADD COLUMN local_rev INTEGER NOT NULL DEFAULT 0;'); } catch (_) {}
+        }
+        if (oldV < 11) {
+          // Clientes y pisciculturas creados o editados en terreno (12-11-2026): la cola de lo que falta subir. Una tabla
+          // nueva: la versión anterior de la app no la ve y abre la base igual. No se resetea ningún cursor.
+          await _createMaestrosPendientes(db);
         }
       },
     );
@@ -161,6 +168,20 @@ class AppDatabase {
     ''');
   }
 
+  Future<void> _createMaestrosPendientes(Database db) async {
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS maestros_pendientes (
+        tipo  TEXT NOT NULL,
+        id    TEXT NOT NULL,
+        nuevo INTEGER NOT NULL DEFAULT 0,
+        datos TEXT NOT NULL,
+        base  TEXT,
+        rev   INTEGER NOT NULL DEFAULT 1,
+        PRIMARY KEY (tipo, id)
+      );
+    ''');
+  }
+
   // ---- Usuarios (para elegir auditor) ----
 
   /// Reemplaza la lista local de usuarios por la del servidor.
@@ -182,15 +203,134 @@ class AppDatabase {
 
   // ---- Maestros (clientes / centros) ----
 
+  /// Aplica un cliente del servidor, salvo que la tablet tenga cambios suyos sin subir: esos se suben primero y el pull
+  /// siguiente lo trae como quedó (lo mismo que con las evaluaciones).
   Future<void> applyClientFromServer(ClientRef c) async {
     final db = await database;
-    await db.insert('clients', c.toRow(), conflictAlgorithm: ConflictAlgorithm.replace);
+    await db.transaction((txn) async {
+      if (await _conPendiente(txn, kTipoCliente, c.id)) return;
+      await txn.insert('clients', c.toRow(), conflictAlgorithm: ConflictAlgorithm.replace);
+    });
   }
 
   Future<void> applyCenterFromServer(CenterRef c) async {
     final db = await database;
-    await db.insert('centers', c.toRow(), conflictAlgorithm: ConflictAlgorithm.replace);
+    await db.transaction((txn) async {
+      if (await _conPendiente(txn, kTipoCentro, c.id)) return;
+      await txn.insert('centers', c.toRow(), conflictAlgorithm: ConflictAlgorithm.replace);
+    });
   }
+
+  Future<bool> _conPendiente(DatabaseExecutor txn, String tipo, String id) async =>
+      (await txn.query('maestros_pendientes', columns: ['id'], where: 'tipo = ? AND id = ?', whereArgs: [tipo, id]))
+          .isNotEmpty;
+
+  // ---- Clientes y pisciculturas creados o editados en terreno ----
+
+  /// Guarda en la tablet un cliente creado ([nuevo]) o editado aquí, y lo deja en la cola para subir. Al editar uno que
+  /// no tenía nada pendiente, lo que tenía la tablet (lo último que bajó del servidor) queda como la base del cambio.
+  Future<void> guardarClienteLocal(ClientRef c, {required bool nuevo}) async {
+    final db = await database;
+    await db.transaction((txn) async {
+      final filas = await txn.query('clients', where: 'id = ?', whereArgs: [c.id]);
+      final antes = filas.isEmpty ? null : ClientRef.fromRow(filas.first);
+      if (antes == null) {
+        await txn.insert('clients', c.toRow());
+      } else {
+        await txn.update('clients', {'name': c.name, 'legal_id': c.legalId}, where: 'id = ?', whereArgs: [c.id]);
+      }
+      await _encolar(txn, kTipoCliente, c.id, datosCliente(c),
+          nuevo: nuevo || antes == null, base: antes == null ? null : datosCliente(antes));
+    });
+  }
+
+  /// Lo mismo para una piscicultura. El cliente dueño se fija al crearla; al editar no cambia.
+  Future<void> guardarCentroLocal(CenterRef c, {required bool nuevo}) async {
+    final db = await database;
+    await db.transaction((txn) async {
+      final filas = await txn.query('centers', where: 'id = ?', whereArgs: [c.id]);
+      final antes = filas.isEmpty ? null : CenterRef.fromRow(filas.first);
+      if (antes == null) {
+        await txn.insert('centers', c.toRow());
+      } else {
+        c.ownerClientId = antes.ownerClientId;
+        await txn.update(
+            'centers', {'name': c.name, 'code': c.code, 'latitude': c.latitude, 'longitude': c.longitude},
+            where: 'id = ?', whereArgs: [c.id]);
+      }
+      await _encolar(txn, kTipoCentro, c.id, datosCentro(c),
+          nuevo: nuevo || antes == null, base: antes == null ? null : datosCentro(antes));
+    });
+  }
+
+  Future<void> _encolar(Transaction txn, String tipo, String id, Map<String, dynamic> datos,
+      {required bool nuevo, Map<String, dynamic>? base}) async {
+    final filas = await txn.query('maestros_pendientes', where: 'tipo = ? AND id = ?', whereArgs: [tipo, id]);
+    if (filas.isEmpty) {
+      await txn.insert('maestros_pendientes',
+          MaestroPendiente(tipo: tipo, id: id, nuevo: nuevo, datos: datos, base: nuevo ? null : base).toRow());
+      return;
+    }
+    // Ya estaba en la cola: se queda con su base (lo que vio del servidor antes del primer cambio) y su «nuevo».
+    final p = MaestroPendiente.fromRow(filas.first)
+      ..datos = datos
+      ..rev += 1;
+    await txn.update('maestros_pendientes', p.toRow(), where: 'tipo = ? AND id = ?', whereArgs: [tipo, id]);
+  }
+
+  /// La cola, clientes primero (una piscicultura nueva puede ser de un cliente nuevo).
+  Future<List<MaestroPendiente>> maestrosPendientes() async {
+    final db = await database;
+    final rows = await db.query('maestros_pendientes', orderBy: "CASE tipo WHEN 'cliente' THEN 0 ELSE 1 END, rowid");
+    return rows.map(MaestroPendiente.fromRow).toList();
+  }
+
+  Future<int> maestrosPendientesCount() async {
+    final db = await database;
+    final r = await db.rawQuery('SELECT COUNT(*) AS c FROM maestros_pendientes');
+    return (r.first['c'] as int?) ?? 0;
+  }
+
+  /// El servidor lo aplicó. Si no se editó mientras el envío iba y volvía, sale de la cola (el pull siguiente lo trae
+  /// como quedó, también lo que la web conservó). Si se editó, sigue pendiente con lo enviado como base.
+  Future<void> maestroSubido(MaestroPendiente enviado) async {
+    final db = await database;
+    await db.transaction((txn) async {
+      final filas = await txn.query('maestros_pendientes',
+          where: 'tipo = ? AND id = ?', whereArgs: [enviado.tipo, enviado.id]);
+      if (filas.isEmpty) return;
+      final p = MaestroPendiente.fromRow(filas.first);
+      if (p.rev == enviado.rev) {
+        await txn.delete('maestros_pendientes', where: 'tipo = ? AND id = ?', whereArgs: [p.tipo, p.id]);
+      } else {
+        p
+          ..nuevo = false
+          ..base = enviado.datos;
+        await txn.update('maestros_pendientes', p.toRow(), where: 'tipo = ? AND id = ?', whereArgs: [p.tipo, p.id]);
+      }
+    });
+  }
+
+  /// El servidor no lo puede aplicar nunca (se eliminó en la web, su cliente ya no existe…): sale de la cola. Uno creado
+  /// aquí que el servidor no tiene se quita también de la tablet (las evaluaciones guardan su nombre); uno que existe
+  /// vuelve a quedar como en el servidor con el próximo pull.
+  Future<void> maestroRechazado(MaestroPendiente p) async {
+    final db = await database;
+    await db.transaction((txn) async {
+      await txn.delete('maestros_pendientes', where: 'tipo = ? AND id = ?', whereArgs: [p.tipo, p.id]);
+      final tabla = p.esCliente ? 'clients' : 'centers';
+      if (p.nuevo) {
+        await txn.delete(tabla, where: 'id = ? AND server_version = 0', whereArgs: [p.id]);
+      } else {
+        // Que el pull lo vuelva a traer aunque su versión no haya cambiado.
+        await txn.update(tabla, {'server_version': 0}, where: 'id = ?', whereArgs: [p.id]);
+        await txn.delete('kv', where: 'key = ?', whereArgs: [p.esCliente ? 'client_cursor' : 'center_cursor']);
+      }
+    });
+  }
+
+  /// Ids de los clientes y pisciculturas con cambios sin subir.
+  Future<Set<String>> idsMaestrosPendientes() async => {for (final p in await maestrosPendientes()) p.id};
 
   Future<List<ClientRef>> activeClients() async {
     final db = await database;
@@ -365,6 +505,7 @@ class AppDatabase {
       await txn.delete('clients');
       await txn.delete('centers');
       await txn.delete('users');
+      await txn.delete('maestros_pendientes');
       await txn.delete('kv', where: 'key <> ?', whereArgs: ['template']);
     });
   }

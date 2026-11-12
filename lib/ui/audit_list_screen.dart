@@ -12,10 +12,12 @@ import '../models/master.dart';
 import '../services/audit_sync_service.dart';
 import '../services/auth_service.dart';
 import '../services/evidencias_en_fila.dart';
+import '../services/master_sync_service.dart';
 import '../services/media_service.dart';
 import '../services/template_service.dart';
 import 'arbol_evaluaciones.dart';
 import 'audit_edit_screen.dart';
+import 'ficha_maestro.dart';
 import 'login_screen.dart';
 import 'tema.dart';
 
@@ -72,6 +74,10 @@ class _AuditListScreenState extends State<AuditListScreen> {
   String? _nombreCentroSel;
   bool _loading = true;
   FiltroLista _filtro = FiltroLista.todas;
+  // Clientes y pisciculturas en terreno: si esta cuenta los puede crear y editar (lo dice el servidor) y cuáles tienen
+  // cambios sin subir.
+  bool _puedeEditar = false;
+  Set<String> _maestrosPorSubir = {};
   bool _outdated = false;
   String _outdatedMsg = '';
 
@@ -123,6 +129,8 @@ class _AuditListScreenState extends State<AuditListScreen> {
     final clientes = await db.activeClients();
     final centros = await db.activeCenters();
     final pending = await pendientesDeLaTablet(db, media); // deja lista la carpeta de las evidencias (hasLocal)
+    final puedeEditar = await db.getValue(MasterSyncService.llavePermiso) == '1';
+    final maestrosPorSubir = await db.idsMaestrosPendientes();
     final porSubir = {
       for (final a in audits)
         if (quedaPorSubir(a, enEstaTablet: media.hasLocal)) a.id,
@@ -131,16 +139,20 @@ class _AuditListScreenState extends State<AuditListScreen> {
     setState(() {
       _clientes = clientes;
       _centros = centros;
-      _grupos = agruparEvaluaciones(evaluaciones: audits, clientes: clientes, centros: centros, porSubir: porSubir);
+      _grupos = agruparEvaluaciones(
+          evaluaciones: audits, clientes: clientes, centros: centros, porSubir: porSubir, clientesSiempre: maestrosPorSubir);
       _pending = pending;
+      _puedeEditar = puedeEditar;
+      _maestrosPorSubir = maestrosPorSubir;
       _loading = false;
     });
   }
 
   // ── Navegación: Cliente → Piscicultura → evaluaciones ──
 
-  /// Con un solo cliente (o solo «Sin cliente») no hay nada que elegir: se parte en sus pisciculturas.
-  bool get _saltaClientes => _grupos.length == 1;
+  /// Con un solo cliente (o solo «Sin cliente») no hay nada que elegir: se parte en sus pisciculturas. Salvo para quien
+  /// puede crear clientes: «Nuevo cliente» está en el nivel de los clientes.
+  bool get _saltaClientes => _grupos.length == 1 && !_puedeEditar;
 
   /// El cliente en que se está (el elegido o el único), o null en el nivel de clientes.
   GrupoCliente? get _cliente {
@@ -289,6 +301,84 @@ class _AuditListScreenState extends State<AuditListScreen> {
     if (mounted) _sync();
   }
 
+  // ── Clientes y pisciculturas en terreno (Administrador y Auditor) ──
+
+  ClientRef? _clienteDelMaestro(String? id) => _clientes.where((c) => c.id == id).firstOrNull;
+  CenterRef? _centroDelMaestro(String? id) => _centros.where((c) => c.id == id).firstOrNull;
+
+  /// Crea un cliente; luego se entra en él y se ofrece su primera piscicultura (se puede dejar para después).
+  Future<void> _nuevoCliente() async {
+    final c = await Navigator.of(context).push<ClientRef>(MaterialPageRoute(builder: (_) => const FichaClienteScreen()));
+    if (c == null || !mounted) return;
+    await _reload();
+    if (!mounted) return;
+    setState(() {
+      _clienteSel = c.id;
+      _nombreClienteSel = c.name;
+      _centroSel = null;
+    });
+    await _nuevoCentro(c.id, c.name, primera: true);
+  }
+
+  Future<void> _editarCliente(ClientRef c) async {
+    final r = await Navigator.of(context).push<ClientRef>(MaterialPageRoute(builder: (_) => FichaClienteScreen(cliente: c)));
+    if (r == null || !mounted) return;
+    if (_clienteSel == c.id) _nombreClienteSel = r.name;
+    await _reload();
+    if (mounted) _sync();
+  }
+
+  /// Crea una piscicultura del cliente y entra en ella, lista para la primera evaluación («Nueva»).
+  Future<void> _nuevoCentro(String clienteId, String clienteNombre, {bool primera = false}) async {
+    final c = await Navigator.of(context).push<CenterRef>(MaterialPageRoute(
+        builder: (_) => FichaCentroScreen(clienteId: clienteId, clienteNombre: clienteNombre, primera: primera)));
+    if (!mounted) return;
+    await _reload();
+    if (c != null && mounted) {
+      setState(() {
+        _centroSel = c.id;
+        _nombreCentroSel = c.name;
+      });
+    }
+    if (mounted) _sync();
+  }
+
+  Future<void> _editarCentro(CenterRef c, String clienteNombre) async {
+    final r = await Navigator.of(context).push<CenterRef>(MaterialPageRoute(
+        builder: (_) => FichaCentroScreen(clienteId: c.ownerClientId ?? '', clienteNombre: clienteNombre, centro: c)));
+    if (r == null || !mounted) return;
+    if (_centroSel == c.id) _nombreCentroSel = r.name;
+    await _reload();
+    if (mounted) _sync();
+  }
+
+  /// La fila para crear, arriba de la lista.
+  Widget _filaNuevo(String texto, IconData icono, VoidCallback alTocar, {required Key key}) => ListTile(
+        key: key,
+        leading: Container(
+          width: 44,
+          alignment: Alignment.center,
+          padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 2),
+          decoration: BoxDecoration(color: Colores.marca.withValues(alpha: 0.12), borderRadius: BorderRadius.circular(6)),
+          child: Icon(icono, color: Colores.marca, size: 20),
+        ),
+        title: Text(texto, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: Colores.marca)),
+        onTap: alTocar,
+      );
+
+  /// El menú «Editar» de la fila de un cliente o una piscicultura.
+  Widget _menuEditar(Key key, VoidCallback alEditar) => PopupMenuButton<String>(
+        key: key,
+        tooltip: 'Opciones',
+        onSelected: (_) => alEditar(),
+        itemBuilder: (_) => const [
+          PopupMenuItem<String>(
+            value: 'editar',
+            child: Row(children: [Icon(Icons.edit_outlined, size: 20), SizedBox(width: 10), Text('Editar datos')]),
+          ),
+        ],
+      );
+
   Future<void> _open(String id) async {
     await Navigator.of(context).push(MaterialPageRoute(builder: (_) => AuditEditScreen(auditId: id)));
     await _reload();
@@ -337,7 +427,12 @@ class _AuditListScreenState extends State<AuditListScreen> {
           ],
           bottom: PreferredSize(
             preferredSize: const Size.fromHeight(30),
-            child: StatusBarSync(status: sync.status, pending: _pending, lastError: sync.lastError, lastSyncAt: sync.lastSyncAt),
+            child: StatusBarSync(
+                status: sync.status,
+                pending: _pending,
+                maestros: _maestrosPorSubir.length,
+                lastError: sync.lastError,
+                lastSyncAt: sync.lastSyncAt),
           ),
         ),
         floatingActionButton: FloatingActionButton.extended(
@@ -454,6 +549,8 @@ class _AuditListScreenState extends State<AuditListScreen> {
     required int porSubir,
     required bool sinAsignar,
     required VoidCallback alTocar,
+    bool datosPorSubir = false,
+    Widget? menu,
   }) {
     final color = sinAsignar ? Colores.pendiente : Colores.marca;
     return ListTile(
@@ -476,12 +573,16 @@ class _AuditListScreenState extends State<AuditListScreen> {
             TextSpan(
                 text: ' · $porSubir por subir',
                 style: const TextStyle(color: Colores.pendiente, fontWeight: FontWeight.w600)),
+          if (datosPorSubir)
+            const TextSpan(
+                text: ' · datos por subir', style: TextStyle(color: Colores.pendiente, fontWeight: FontWeight.w600)),
         ]),
         style: const TextStyle(fontSize: 14, color: Colores.texto2),
       ),
       trailing: Row(mainAxisSize: MainAxisSize.min, children: [
-        if (porSubir > 0)
+        if (porSubir > 0 || datosPorSubir)
           const Tooltip(message: 'Falta subir', child: Icon(Icons.cloud_upload_outlined, size: 22, color: Colores.pendiente)),
+        if (menu != null) menu,
         const SizedBox(width: 4),
         const Icon(Icons.chevron_right, color: Colores.texto2),
       ]),
@@ -490,20 +591,27 @@ class _AuditListScreenState extends State<AuditListScreen> {
   }
 
   Widget _listaClientes() {
-    if (_grupos.isEmpty) return _vacio('Sin evaluaciones.');
+    if (_grupos.isEmpty && !_puedeEditar) return _vacio('Sin evaluaciones.');
+    final extra = _puedeEditar ? 1 : 0; // «Nuevo cliente», arriba
     return ListView.separated(
       padding: const EdgeInsets.only(bottom: 88), // que el botón «Nueva» no tape el último
-      itemCount: _grupos.length,
+      itemCount: _grupos.length + extra,
       separatorBuilder: (_, __) => const Divider(height: 1),
       itemBuilder: (_, i) {
-        final g = _grupos[i];
+        if (i < extra) {
+          return _filaNuevo('Nuevo cliente', Icons.add_business_outlined, _nuevoCliente, key: const ValueKey('nuevo-cliente'));
+        }
+        final g = _grupos[i - extra];
+        final maestro = _puedeEditar ? _clienteDelMaestro(g.id) : null;
         return _filaGrupo(
           key: ValueKey('cliente-${g.clave}'),
           icono: Icons.business_outlined,
           nombre: g.nombre,
           detalle: [if (g.pisciculturas > 0) nPisciculturas(g.pisciculturas), nEvaluaciones(g.evaluaciones)].join(' · '),
           porSubir: g.porSubir,
+          datosPorSubir: _maestrosPorSubir.contains(g.id),
           sinAsignar: g.id == null,
+          menu: maestro == null ? null : _menuEditar(ValueKey('editar-cliente-${g.clave}'), () => _editarCliente(maestro)),
           alTocar: () => _elegirCliente(g),
         );
       },
@@ -512,20 +620,30 @@ class _AuditListScreenState extends State<AuditListScreen> {
 
   Widget _listaCentros(GrupoCliente g) {
     final centros = g.centros;
-    if (centros.isEmpty) return _vacio('Sin evaluaciones.');
+    // «Nueva piscicultura» solo dentro de un cliente del maestro (no en «Sin cliente»).
+    final puedeCrear = _puedeEditar && _clienteDelMaestro(g.id) != null;
+    if (centros.isEmpty && !puedeCrear) return _vacio('Sin evaluaciones.');
+    final extra = puedeCrear ? 1 : 0;
     return ListView.separated(
       padding: const EdgeInsets.only(bottom: 88),
-      itemCount: centros.length,
+      itemCount: centros.length + extra,
       separatorBuilder: (_, __) => const Divider(height: 1),
       itemBuilder: (_, i) {
-        final c = centros[i];
+        if (i < extra) {
+          return _filaNuevo('Nueva piscicultura', Icons.add_location_alt_outlined, () => _nuevoCentro(g.id!, g.nombre),
+              key: const ValueKey('nuevo-centro'));
+        }
+        final c = centros[i - extra];
+        final maestro = _puedeEditar ? _centroDelMaestro(c.id) : null;
         return _filaGrupo(
           key: ValueKey('centro-${c.clave}'),
           icono: Icons.water_outlined,
           nombre: c.nombre,
           detalle: nEvaluaciones(c.evaluaciones.length),
           porSubir: c.porSubir,
+          datosPorSubir: _maestrosPorSubir.contains(c.id),
           sinAsignar: c.id == null,
+          menu: maestro == null ? null : _menuEditar(ValueKey('editar-centro-${c.clave}'), () => _editarCentro(maestro, g.nombre)),
           alTocar: () => _elegirCentro(c),
         );
       },
@@ -682,11 +800,25 @@ class _StatusChip extends StatelessWidget {
 class StatusBarSync extends StatelessWidget {
   final SyncStatus status;
   final int pending;
+
+  /// Clientes y pisciculturas creados o editados en la tablet que faltan por subir.
+  final int maestros;
   final String? lastError;
   final DateTime? lastSyncAt;
-  const StatusBarSync({super.key, required this.status, required this.pending, this.lastError, this.lastSyncAt});
+  const StatusBarSync(
+      {super.key, required this.status, required this.pending, this.maestros = 0, this.lastError, this.lastSyncAt});
 
   static String porSubir(int n) => n == 1 ? '1 evaluación por subir' : '$n evaluaciones por subir';
+
+  /// Lo que falta subir en palabras: las evaluaciones como siempre, y los clientes o pisciculturas si hay.
+  String get _porSubir {
+    if (maestros == 0) return porSubir(pending);
+    final m = maestros == 1 ? '1 cliente o piscicultura' : '$maestros clientes o pisciculturas';
+    if (pending == 0) return '$m por subir';
+    return '${pending == 1 ? '1 evaluación' : '$pending evaluaciones'} y $m por subir';
+  }
+
+  int get _total => pending + maestros;
 
   static String hora(DateTime t) {
     final l = t.toLocal();
@@ -697,20 +829,20 @@ class StatusBarSync extends StatelessWidget {
   (String, Color) get estado => switch (status) {
         SyncStatus.syncing => ('Sincronizando…', const Color(0xFF1D4ED8)),
         SyncStatus.offline => (
-            pending == 0 ? 'Sin señal' : 'Sin señal · ${porSubir(pending)}: quedan guardadas en la tablet',
+            _total == 0 ? 'Sin señal' : 'Sin señal · $_porSubir: quedan guardadas en la tablet',
             Colores.texto2
           ),
         SyncStatus.error => (
             lastError == AuditSyncService.kSesionVencida
                 ? 'Sesión vencida: entra de nuevo para sincronizar'
-                : 'No se pudo sincronizar todo${pending > 0 ? ' · ${porSubir(pending)}' : ''} · toca para ver por qué',
+                : 'No se pudo sincronizar todo${_total > 0 ? ' · $_porSubir' : ''} · toca para ver por qué',
             Colores.peligro
           ),
         SyncStatus.idle => (
-            pending == 0
+            _total == 0
                 ? 'Todo sincronizado${lastSyncAt == null ? '' : ' · ${hora(lastSyncAt!)}'}'
-                : porSubir(pending),
-            pending == 0 ? Colores.ok : Colores.pendiente
+                : _porSubir,
+            _total == 0 ? Colores.ok : Colores.pendiente
           ),
       };
 

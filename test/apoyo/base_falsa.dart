@@ -6,6 +6,7 @@ import 'dart:io';
 import 'package:aolab_android/data/app_database.dart';
 import 'package:aolab_android/data/reglas_sync.dart';
 import 'package:aolab_android/models/audit.dart';
+import 'package:aolab_android/models/maestro_terreno.dart';
 import 'package:aolab_android/models/master.dart';
 import 'package:aolab_android/models/questionnaire.dart';
 import 'package:aolab_android/services/api_client.dart';
@@ -29,7 +30,12 @@ class BaseEnMemoria extends AppDatabase {
   final List<CenterRef> centros;
   final List<ClientRef> clientes;
   int guardados = 0;
-  BaseEnMemoria(this.centros, {this.clientes = const []});
+  BaseEnMemoria(List<CenterRef> centros, {List<ClientRef> clientes = const []})
+      : centros = [...centros],
+        clientes = [...clientes];
+
+  /// La cola de clientes y pisciculturas por subir, como la tabla maestros_pendientes (clave «tipo:id», en orden).
+  final Map<String, MaestroPendiente> pendientes = {};
 
   Audit _copia(Audit a) => Audit.fromRow(a.toRow());
 
@@ -43,11 +49,108 @@ class BaseEnMemoria extends AppDatabase {
   }
 
   @override
-  Future<List<ClientRef>> activeClients() async => clientes;
+  Future<List<ClientRef>> activeClients() async =>
+      [for (final c in clientes) if (c.isActive && !c.isDeleted) ClientRef.fromRow(c.toRow())]
+        ..sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
   @override
-  Future<List<CenterRef>> activeCenters() async => centros;
+  Future<List<CenterRef>> activeCenters() async =>
+      [for (final c in centros) if (c.isActive && !c.isDeleted) CenterRef.fromRow(c.toRow())];
+
+  // ── Maestros: lo mismo que AppDatabase con SQLite (lo prueba de verdad integration_local/maestros_sqlite_test) ──
+
+  @override
+  Future<void> applyClientFromServer(ClientRef c) async {
+    if (pendientes.containsKey('$kTipoCliente:${c.id}')) return;
+    clientes.removeWhere((x) => x.id == c.id);
+    clientes.add(c);
+  }
+
+  @override
+  Future<void> applyCenterFromServer(CenterRef c) async {
+    if (pendientes.containsKey('$kTipoCentro:${c.id}')) return;
+    centros.removeWhere((x) => x.id == c.id);
+    centros.add(c);
+  }
+
+  void _encolar(String tipo, String id, Map<String, dynamic> datos, {required bool nuevo, Map<String, dynamic>? base}) {
+    final p = pendientes['$tipo:$id'];
+    if (p == null) {
+      pendientes['$tipo:$id'] = MaestroPendiente(tipo: tipo, id: id, nuevo: nuevo, datos: datos, base: nuevo ? null : base);
+    } else {
+      p
+        ..datos = datos
+        ..rev += 1;
+    }
+  }
+
+  @override
+  Future<void> guardarClienteLocal(ClientRef c, {required bool nuevo}) async {
+    final i = clientes.indexWhere((x) => x.id == c.id);
+    final antes = i < 0 ? null : clientes[i];
+    if (antes == null) {
+      clientes.add(ClientRef.fromRow(c.toRow()));
+    } else {
+      clientes[i] = ClientRef.fromRow({...antes.toRow(), 'name': c.name, 'legal_id': c.legalId});
+    }
+    _encolar(kTipoCliente, c.id, datosCliente(c), nuevo: nuevo || antes == null, base: antes == null ? null : datosCliente(antes));
+  }
+
+  @override
+  Future<void> guardarCentroLocal(CenterRef c, {required bool nuevo}) async {
+    final i = centros.indexWhere((x) => x.id == c.id);
+    final antes = i < 0 ? null : centros[i];
+    if (antes == null) {
+      centros.add(CenterRef.fromRow(c.toRow()));
+    } else {
+      c.ownerClientId = antes.ownerClientId;
+      centros[i] = CenterRef.fromRow(
+          {...antes.toRow(), 'name': c.name, 'code': c.code, 'latitude': c.latitude, 'longitude': c.longitude});
+    }
+    _encolar(kTipoCentro, c.id, datosCentro(c), nuevo: nuevo || antes == null, base: antes == null ? null : datosCentro(antes));
+  }
+
+  @override
+  Future<List<MaestroPendiente>> maestrosPendientes() async => [
+        for (final p in pendientes.values) if (p.esCliente) MaestroPendiente.fromRow(p.toRow()),
+        for (final p in pendientes.values) if (!p.esCliente) MaestroPendiente.fromRow(p.toRow()),
+      ];
+
+  @override
+  Future<int> maestrosPendientesCount() async => pendientes.length;
+
+  @override
+  Future<Set<String>> idsMaestrosPendientes() async => {for (final p in pendientes.values) p.id};
+
+  @override
+  Future<void> maestroSubido(MaestroPendiente enviado) async {
+    final p = pendientes['${enviado.tipo}:${enviado.id}'];
+    if (p == null) return;
+    if (p.rev == enviado.rev) {
+      pendientes.remove('${p.tipo}:${p.id}');
+    } else {
+      p
+        ..nuevo = false
+        ..base = enviado.datos;
+    }
+  }
+
+  @override
+  Future<void> maestroRechazado(MaestroPendiente p) async {
+    pendientes.remove('${p.tipo}:${p.id}');
+    if (p.nuevo) {
+      if (p.esCliente) {
+        clientes.removeWhere((x) => x.id == p.id && x.serverVersion == 0);
+      } else {
+        centros.removeWhere((x) => x.id == p.id && x.serverVersion == 0);
+      }
+    }
+  }
   @override
   Future<List<UserRef>> allUsers() async => [];
+  @override
+  Future<void> replaceUsers(List<UserRef> users) async {}
+  @override
+  Future<void> setCatalogs(Map<String, dynamic> catalogs) async {}
   @override
   Future<Map<String, List<String>>> getCatalogs() async => {};
   @override
@@ -83,6 +186,17 @@ class BaseEnMemoria extends AppDatabase {
     final a = audits[auditId];
     if (a == null || ids.isEmpty) return;
     if (marcarSubidas(a.document, ids) > 0) a.dirty = true;
+  }
+
+  @override
+  Future<List<Audit>> dirtyAudits() async => audits.values.where((a) => a.dirty).map(_copia).toList();
+
+  @override
+  Future<void> markSynced(String id, int serverVersion, {int? folio, required int revEnviada, int? folioEnviado}) async {
+    final a = audits[id];
+    if (a == null) return;
+    a.serverVersion = serverVersion;
+    if (a.localRev == revEnviada) a.dirty = false;
   }
 
   @override

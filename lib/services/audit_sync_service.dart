@@ -124,6 +124,8 @@ class AuditSyncService extends ChangeNotifier {
     }
 
     await step('Fotos y audios', _uploadMedia);
+    // Antes que las evaluaciones: una evaluación nueva puede ser de un cliente o una piscicultura recién creados aquí.
+    await step('Clientes y pisciculturas', _pushMaestros);
     await step('Subir', _push);
     await step('Papelera', _borrarEvidencias);
     await step('Bajar', () => _pull(errors));
@@ -154,6 +156,12 @@ class AuditSyncService extends ChangeNotifier {
       final subidas = await media.uploadPending(pendientes);
       await db.marcarEvidenciasSubidas(a.id, subidas);
       if (media.sinRed) throw const SinSenal();
+    }
+  }
+
+  Future<void> _pushMaestros() async {
+    for (final a in await masters.push()) {
+      _avisar(a);
     }
   }
 
@@ -229,6 +237,7 @@ class AuditSyncService extends ChangeNotifier {
   /// El error de un paso de la sincronización en palabras del evaluador (sin el texto de la librería de red).
   static String mensajeDeSync(String paso, Object e) {
     if (e is SinSenal) return '$paso: la señal no alcanzó para subirlos. Quedan en la tablet y se suben en la próxima sincronización.';
+    if (e is AvisoSync) return e.mensaje;
     if (e is DioException) {
       final code = e.response?.statusCode;
       if (code == 403) return 'Tu cuenta no tiene acceso a la sincronización: la app es para el personal de AOLAB.';

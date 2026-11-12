@@ -21,8 +21,9 @@ class _DatosDeLaTablet implements DatosLocales {
   final MediaService media;
   _DatosDeLaTablet(this.db, this.media);
 
+  // También los clientes y pisciculturas creados o editados aquí: cambiar de usuario borra la tablet.
   @override
-  Future<int> pendientes() => pendientesDeLaTablet(db, media);
+  Future<int> pendientes() async => await pendientesDeLaTablet(db, media) + await db.maestrosPendientesCount();
 
   @override
   Future<void> borrarTodo() async {

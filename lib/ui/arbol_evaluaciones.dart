@@ -56,11 +56,14 @@ class GrupoCliente {
 /// - Las pisciculturas activas del maestro aparecen bajo su cliente dueño aunque no tengan evaluaciones (para crear una
 ///   desde ahí). Un cliente sin pisciculturas ni evaluaciones no aparece; un centro sin dueño, solo si tiene evaluaciones.
 /// - [porSubir] son los ids de las evaluaciones que esta tablet tiene por subir.
+/// - Los clientes de [clientesSiempre] (los creados o editados en la tablet que faltan por subir) aparecen aunque todavía
+///   no tengan pisciculturas: recién creado, de ahí se le crea la primera.
 List<GrupoCliente> agruparEvaluaciones({
   required List<Audit> evaluaciones,
   required List<ClientRef> clientes,
   required List<CenterRef> centros,
   Set<String> porSubir = const {},
+  Set<String> clientesSiempre = const {},
 }) {
   final clientePorId = {for (final c in clientes) c.id: c};
   final centroPorId = {for (final c in centros) c.id: c};
@@ -79,6 +82,9 @@ List<GrupoCliente> agruparEvaluaciones({
         return GrupoCentro(id, n.isEmpty ? nombreGuardado : n);
       });
 
+  for (final c in clientes) {
+    if (clientesSiempre.contains(c.id)) cliente(c.id, null);
+  }
   for (final c in centros) {
     final dueno = c.ownerClientId;
     if (dueno != null && clientePorId.containsKey(dueno)) centro(cliente(dueno, null), c.id, c.name);
